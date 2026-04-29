@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MySQL 批量运维工具</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="header">
+  <div class="header-title">
+    <div class="icon">🐬</div>
+    MySQL 批量运维工具
+    <span class="header-version">v1.0</span>
+  </div>
+  <div class="header-badge" id="configPath">config.ini</div>
+</div>
+
+<div class="main">
+  <!-- Control Panel -->
+  <div class="control-panel">
+    <div class="control-row">
+      <div class="form-group" style="flex:1;">
+        <label>连接实例</label>
+        <select id="connectionSelect">
+          <option value="">— 加载中... —</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>前缀匹配</label>
+        <input type="text" id="prefixInput" placeholder="可选" spellcheck="false">
+      </div>
+      <div class="form-group">
+        <label>后缀匹配</label>
+        <input type="text" id="suffixInput" placeholder="可选" spellcheck="false">
+      </div>
+      <div class="form-group" style="align-self:flex-end;">
+        <button class="btn btn-primary" id="btnMatch">🔍 匹配数据库</button>
+      </div>
+      <div style="flex:1;text-align:right;align-self:flex-end;">
+        <button class="btn btn-outline" id="btnConfigDir">📂 配置目录</button>
+        <button class="btn btn-outline" id="btnRefresh">🔄 刷新配置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Database List -->
+  <div class="db-list-panel" id="dbListPanel">
+    <div class="db-list-header">
+      <label>
+        <input type="checkbox" id="checkAll" checked>
+        匹配数据库
+        <span class="match-count" id="matchCount">(<strong>0</strong> 个)</span>
+      </label>
+      <div>
+        <button class="btn btn-outline" id="btnToggleDbList" style="padding:4px 10px;font-size:11px;">
+          <span id="dbToggleIcon">▲</span>
+        </button>
+      </div>
+    </div>
+    <div class="db-list-body" id="dbListBody">
+      <div class="db-empty">点击「匹配数据库」查询</div>
+    </div>
+  </div>
+
+  <!-- SQL Editor -->
+  <div class="sql-section">
+    <div class="sql-editor-wrapper">
+      <div class="sql-editor-header">
+        <span class="label">SQL 脚本</span>
+        <span class="hint">按 <kbd>Ctrl</kbd> + <kbd>Enter</kbd> 快速执行</span>
+      </div>
+      <textarea id="sqlEditor" placeholder="在此输入 SQL 脚本，每句以分号结尾&#10;示例:&#10;  UPDATE users SET status = 'active' WHERE created_at < '2024-01-01';&#10;  DELETE FROM temp_logs WHERE expire_at < NOW();" spellcheck="false"></textarea>
+    </div>
+    <div class="sql-actions">
+      <button class="btn btn-success" id="btnExecute">▶ 同步执行</button>
+      <button class="btn btn-outline" id="btnClearLog">🗑 清空日志</button>
+      <div style="flex:1;"></div>
+      <span id="execProgress" style="font-size:12px;color:var(--text-muted);align-self:center;display:none;"></span>
+    </div>
+  </div>
+
+  <!-- Log Panel -->
+  <div class="log-panel">
+    <div class="log-header">
+      <span class="label">📋 执行日志</span>
+      <div class="status-bar" id="statusBar">
+        <span>成功: <span class="s-count" id="successCount">0</span></span>
+        <span>失败: <span class="f-count" id="failCount">0</span></span>
+      </div>
+    </div>
+    <div class="log-body" id="logBody">
+      <div class="log-empty">等待执行...</div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

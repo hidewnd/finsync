@@ -1,0 +1,19 @@
+{
+  "name": "finsync",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bash -c \"node_modules/.bin/vite\"",
+    "build": "bash -c \"node_modules/.bin/vite build\"",
+    "preview": "bash -c \"node_modules/.bin/vite preview\"",
+    "tauri": "bash -c \"node_modules/.bin/tauri\""
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "vite": "^5.0.0"
+  }
+}

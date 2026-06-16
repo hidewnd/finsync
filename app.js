@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event';
 // ── State ─────────────────────────────────────────────────────────
 let currentDatabases = [];
 let executing = false;
+let stopRequested = false;
 let logCount = 0;
 const MAX_LOG = 1000;
 
@@ -19,6 +20,8 @@ window.addEventListener('DOMContentLoaded', () => {
   // Wire up event handlers
   document.getElementById('btnMatch').addEventListener('click', matchDatabases);
   document.getElementById('btnExecute').addEventListener('click', executeSQL);
+  document.getElementById('btnStopExecution').addEventListener('click', stopExecution);
+  document.getElementById('btnSkipExecution').addEventListener('click', skipExecution);
   document.getElementById('btnClearLog').addEventListener('click', clearLogs);
   document.getElementById('btnRefresh').addEventListener('click', refreshConfig);
   document.getElementById('btnConfigDir').addEventListener('click', openConfigDir);
@@ -76,10 +79,13 @@ function updateConnStatus(status) {
   }
 }
 
-function openConfigDir() {
-  // Tauri doesn't have window.open for filesystem access.
-  // Show the config location information to the user.
-  showToast('配置文件 config.ini 位于应用程序所在目录，用文本编辑器即可编辑', 'info');
+async function openConfigDir() {
+  try {
+    await invoke('open_config_dir');
+    showToast('已打开配置文件所在目录', 'success');
+  } catch (err) {
+    showToast('打开配置目录失败: ' + (typeof err === 'string' ? err : err.message || '未知错误'), 'error');
+  }
 }
 
 // ── Database Matching ─────────────────────────────────────────────
@@ -203,11 +209,11 @@ async function executeSQL() {
 
   // Lock UI
   executing = true;
-  document.getElementById('btnExecute').disabled = true;
-  document.getElementById('btnExecute').textContent = '⏳ 执行中...';
-  document.getElementById('sqlEditor').disabled = true;
+  stopRequested = false;
+  setExecutionControls(true);
   document.getElementById('successCount').textContent = '0';
   document.getElementById('failCount').textContent = '0';
+  document.getElementById('skipCount').textContent = '0';
   clearLogs();
 
   addLog('info', '', '🚀 开始执行...', '');
@@ -218,13 +224,20 @@ async function executeSQL() {
     const payload = event.payload;
     if (payload && payload.result) {
       const r = payload.result;
-      const statusClass = r.success ? 'success' : 'error';
-      const statusText = r.success ? '✅ 成功' : '❌ 失败';
+      const status = payload.status || (r.success ? 'success' : 'failure');
+      const statusClass = (status === 'skipped' || status === 'stopped') ? 'warning' : (r.success ? 'success' : 'error');
+      const statusText = status === 'skipped' ? '⏭ 跳过' : (status === 'stopped' ? '■ 终止' : (r.success ? '✅ 成功' : '❌ 失败'));
       const duration = r.duration != null ? ` (${Number(r.duration).toFixed(2)}s)` : '';
-      const msg = r.success ? '执行成功' : (r.error || '未知错误');
-      addLog(statusClass, r.database, statusText, `${msg}${duration}`);
+      const msg = (status === 'skipped' || status === 'stopped') ? (r.error || '已处理控制请求') : (r.success ? '执行成功' : (r.error || '未知错误'));
+      addLog(statusClass, r.database, statusText, `${msg}${(status === 'skipped' || status === 'stopped') ? '' : duration}`);
 
-      if (r.success) {
+      if (status === 'skipped') {
+        document.getElementById('skipCount').textContent =
+          parseInt(document.getElementById('skipCount').textContent) + 1;
+        if (!stopRequested) {
+          document.getElementById('btnSkipExecution').disabled = false;
+        }
+      } else if (r.success) {
         document.getElementById('successCount').textContent =
           parseInt(document.getElementById('successCount').textContent) + 1;
       } else {
@@ -242,16 +255,15 @@ async function executeSQL() {
     const payload = event.payload;
     if (payload && payload.summary) {
       const s = payload.summary;
-      addLog('summary', '', '🏁 执行完成',
-        `共 ${s.total} 个库，成功 ${s.success_count}，失败 ${s.fail_count}`);
+      const statusText = s.stopped ? '■ 已终止' : '🏁 执行完成';
+      addLog('summary', '', statusText,
+        `共 ${s.total} 个库，成功 ${s.success_count}，失败 ${s.fail_count}，跳过 ${s.skipped_count || 0}`);
     }
 
     // Unlock UI
     executing = false;
-    document.getElementById('btnExecute').disabled = false;
-    document.getElementById('btnExecute').textContent = '▶ 同步执行';
-    document.getElementById('sqlEditor').disabled = false;
-    document.getElementById('execProgress').style.display = 'none';
+    stopRequested = false;
+    setExecutionControls(false);
 
     // Clean up listeners
     await cleanupListeners();
@@ -269,13 +281,46 @@ async function executeSQL() {
 
     // Unlock UI on invoke failure
     executing = false;
-    document.getElementById('btnExecute').disabled = false;
-    document.getElementById('btnExecute').textContent = '▶ 同步执行';
-    document.getElementById('sqlEditor').disabled = false;
-    document.getElementById('execProgress').style.display = 'none';
+    stopRequested = false;
+    setExecutionControls(false);
 
     await cleanupListeners();
   }
+}
+
+async function stopExecution() {
+  if (!executing) return;
+
+  try {
+    await invoke('stop_execution');
+    stopRequested = true;
+    addLog('warning', '', '■ 终止', '已请求终止执行，当前数据库将在安全边界回滚后停止');
+    document.getElementById('btnStopExecution').disabled = true;
+    document.getElementById('btnSkipExecution').disabled = true;
+  } catch (err) {
+    showToast('终止请求失败: ' + (typeof err === 'string' ? err : err.message || '未知错误'), 'error');
+  }
+}
+
+async function skipExecution() {
+  if (!executing) return;
+
+  try {
+    await invoke('skip_execution');
+    addLog('warning', '', '⏭ 跳过', '已请求跳过当前数据库');
+    document.getElementById('btnSkipExecution').disabled = true;
+  } catch (err) {
+    showToast('跳过请求失败: ' + (typeof err === 'string' ? err : err.message || '未知错误'), 'error');
+  }
+}
+
+function setExecutionControls(active) {
+  document.getElementById('btnExecute').disabled = active;
+  document.getElementById('btnExecute').textContent = active ? '⏳ 执行中...' : '▶ 同步执行';
+  document.getElementById('btnStopExecution').disabled = !active;
+  document.getElementById('btnSkipExecution').disabled = !active;
+  document.getElementById('sqlEditor').disabled = active;
+  document.getElementById('execProgress').style.display = active ? 'inline' : 'none';
 }
 
 async function cleanupListeners() {
@@ -325,6 +370,7 @@ function clearLogs() {
   body.innerHTML = '<div class="log-empty">等待执行...</div>';
   document.getElementById('successCount').textContent = '0';
   document.getElementById('failCount').textContent = '0';
+  document.getElementById('skipCount').textContent = '0';
   logCount = 0;
 }
 

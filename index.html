@@ -75,6 +75,8 @@
     </div>
     <div class="sql-actions">
       <button class="btn btn-success" id="btnExecute">▶ 同步执行</button>
+      <button class="btn btn-danger" id="btnStopExecution" disabled>■ 终止执行</button>
+      <button class="btn btn-warning" id="btnSkipExecution" disabled>⏭ 跳过当前</button>
       <button class="btn btn-outline" id="btnClearLog">🗑 清空日志</button>
       <div style="flex:1;"></div>
       <span id="execProgress" style="font-size:12px;color:var(--text-muted);align-self:center;display:none;"></span>
@@ -88,6 +90,7 @@
       <div class="status-bar" id="statusBar">
         <span>成功: <span class="s-count" id="successCount">0</span></span>
         <span>失败: <span class="f-count" id="failCount">0</span></span>
+        <span>跳过: <span class="skip-count" id="skipCount">0</span></span>
       </div>
     </div>
     <div class="log-body" id="logBody">

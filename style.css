@@ -175,6 +175,15 @@ body {
 }
 .btn-success:hover:not(:disabled) { background: #047857; }
 
+.btn-warning {
+  background: transparent;
+  color: var(--warning);
+  border: 1px solid var(--warning);
+}
+.btn-warning:hover:not(:disabled) {
+  background: rgba(251,191,36,0.1);
+}
+
 .btn-outline {
   background: transparent;
   color: var(--text-secondary);
@@ -379,6 +388,7 @@ body {
 }
 .log-header .status-bar .s-count { color: var(--success); }
 .log-header .status-bar .f-count { color: var(--error); }
+.log-header .status-bar .skip-count { color: var(--warning); }
 .log-body {
   flex: 1;
   overflow-y: auto;
@@ -430,6 +440,13 @@ body {
 .log-entry.error .log-status { color: var(--error); }
 .log-entry.error .log-msg { color: var(--error); }
 .log-entry.info .log-status { color: var(--accent); }
+.log-entry.warning {
+  background: rgba(251,191,36,0.05);
+}
+.log-entry.warning .log-status,
+.log-entry.warning .log-msg {
+  color: var(--warning);
+}
 .log-entry.summary {
   background: rgba(108,140,255,0.06);
   border-top: 1px solid var(--border);

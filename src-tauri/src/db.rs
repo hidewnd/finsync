@@ -3,6 +3,7 @@ use mysql::*;
 use std::time::Instant;
 
 use crate::config::ConnectionConfig;
+use crate::logging;
 
 // ── System databases ──────────────────────────────────────────────
 
@@ -89,10 +90,12 @@ pub struct ExecResult {
 /// Returns a human-readable `String` error when the pool cannot be
 /// created or the initial ping fails.
 pub fn connect(cfg: &ConnectionConfig) -> Result<Pool, String> {
-    let port: u16 = cfg
-        .port
-        .parse()
-        .unwrap_or(3306);
+    let port: u16 = cfg.port.parse().unwrap_or(3306);
+    logging::debug(format!(
+        "db::connect 开始 {} resolved_port={}",
+        logging::format_connection_for_log(cfg),
+        port
+    ));
 
     let opts = OptsBuilder::new()
         .ip_or_hostname(Some(cfg.host.as_str()))
@@ -103,17 +106,30 @@ pub fn connect(cfg: &ConnectionConfig) -> Result<Pool, String> {
         // Init command: every connection from the pool runs this
         .init(vec!["SET NAMES utf8mb4"]);
 
-    let pool = Pool::new(opts).map_err(|e| format!("数据库连接失败: {}", e))?;
+    let pool = Pool::new(opts).map_err(|e| {
+        let err = format!("数据库连接失败: {}", e);
+        logging::error(format!("db::connect 失败 {}", err));
+        err
+    })?;
 
     // Verify connectivity: acquire a connection and execute a lightweight
     // query. PooledConn in mysql 28 does not expose a direct ping() through
     // DerefMut, so we use SELECT 1 as the liveness check.
-    let mut conn = pool
-        .get_conn()
-        .map_err(|e| format!("获取连接失败: {}", e))?;
-    conn.query_drop("SELECT 1")
-        .map_err(|e| format!("连接验证失败: {}", e))?;
+    let mut conn = pool.get_conn().map_err(|e| {
+        let err = format!("获取连接失败: {}", e);
+        logging::error(format!("db::connect 失败 {}", err));
+        err
+    })?;
+    conn.query_drop("SELECT 1").map_err(|e| {
+        let err = format!("连接验证失败: {}", e);
+        logging::error(format!("db::connect 失败 {}", err));
+        err
+    })?;
 
+    logging::debug(format!(
+        "db::connect 完成 {}",
+        logging::format_connection_for_log(cfg)
+    ));
     Ok(pool)
 }
 
@@ -127,27 +143,38 @@ pub fn connect(cfg: &ConnectionConfig) -> Result<Pool, String> {
 /// * `suffix` – Required name suffix (empty = skip).
 ///
 /// Both filters use AND-logic via [`match_filter`].
-pub fn list_databases(
-    pool: &Pool,
-    prefix: &str,
-    suffix: &str,
-) -> Result<Vec<String>, String> {
-    let mut conn = pool
-        .get_conn()
-        .map_err(|e| format!("获取数据库连接失败: {}", e))?;
+pub fn list_databases(pool: &Pool, prefix: &str, suffix: &str) -> Result<Vec<String>, String> {
+    logging::debug(format!(
+        "db::list_databases 开始 prefix={} suffix={}",
+        prefix, suffix
+    ));
+    let mut conn = pool.get_conn().map_err(|e| {
+        let err = format!("获取数据库连接失败: {}", e);
+        logging::error(format!("db::list_databases 失败 {}", err));
+        err
+    })?;
 
     let rows: Vec<String> = conn
         .query_map("SHOW DATABASES", |row: Row| {
             let name: String = row.get(0).unwrap_or_default();
             name
         })
-        .map_err(|e| format!("查询数据库列表失败: {}", e))?;
+        .map_err(|e| {
+            let err = format!("查询数据库列表失败: {}", e);
+            logging::error(format!("db::list_databases 失败 {}", err));
+            err
+        })?;
 
     let filtered: Vec<String> = rows
         .into_iter()
         .filter(|name| !is_system_db(name) && match_filter(name, prefix, suffix))
         .collect();
 
+    logging::debug(format!(
+        "db::list_databases 完成 count={} databases={:?}",
+        filtered.len(),
+        filtered
+    ));
     Ok(filtered)
 }
 
@@ -164,7 +191,22 @@ pub fn list_databases(
 /// On any error the transaction is rolled back and the failure is
 /// recorded in the returned [`ExecResult`].
 pub fn execute_on_database(pool: &Pool, db_name: &str, sql: &str) -> ExecResult {
+    execute_on_database_with_control(pool, db_name, sql, || None)
+}
+
+/// Executes SQL against one database and allows callers to request a
+/// rollback at the final safe checkpoint before COMMIT.
+pub fn execute_on_database_with_control(
+    pool: &Pool,
+    db_name: &str,
+    sql: &str,
+    mut rollback_reason: impl FnMut() -> Option<String>,
+) -> ExecResult {
     let start = Instant::now();
+    logging::debug(format!(
+        "db::execute_on_database 开始 database={} sql={}",
+        db_name, sql
+    ));
 
     let mut result = ExecResult {
         database: db_name.to_string(),
@@ -179,6 +221,10 @@ pub fn execute_on_database(pool: &Pool, db_name: &str, sql: &str) -> ExecResult 
         Err(e) => {
             result.error = format!("获取数据库连接失败: {}", e);
             result.duration = start.elapsed().as_secs_f64();
+            logging::error(format!(
+                "db::execute_on_database 失败 database={} duration={:.6} error={}",
+                db_name, result.duration, result.error
+            ));
             return result;
         }
     };
@@ -187,6 +233,10 @@ pub fn execute_on_database(pool: &Pool, db_name: &str, sql: &str) -> ExecResult 
     if let Err(e) = conn.query_drop("START TRANSACTION") {
         result.error = format!("开始事务失败: {}", e);
         result.duration = start.elapsed().as_secs_f64();
+        logging::error(format!(
+            "db::execute_on_database 失败 database={} duration={:.6} error={}",
+            db_name, result.duration, result.error
+        ));
         return result;
     }
 
@@ -197,6 +247,10 @@ pub fn execute_on_database(pool: &Pool, db_name: &str, sql: &str) -> ExecResult 
         let _ = conn.query_drop("ROLLBACK");
         result.error = format!("设置字符集失败: {}", e);
         result.duration = start.elapsed().as_secs_f64();
+        logging::error(format!(
+            "db::execute_on_database 失败 database={} duration={:.6} error={}",
+            db_name, result.duration, result.error
+        ));
         return result;
     }
 
@@ -205,6 +259,10 @@ pub fn execute_on_database(pool: &Pool, db_name: &str, sql: &str) -> ExecResult 
         let _ = conn.query_drop("ROLLBACK");
         result.error = format!("切换数据库 `{}` 失败: {}", db_name, e);
         result.duration = start.elapsed().as_secs_f64();
+        logging::error(format!(
+            "db::execute_on_database 失败 database={} duration={:.6} error={}",
+            db_name, result.duration, result.error
+        ));
         return result;
     }
 
@@ -213,6 +271,21 @@ pub fn execute_on_database(pool: &Pool, db_name: &str, sql: &str) -> ExecResult 
         let _ = conn.query_drop("ROLLBACK");
         result.error = format!("执行 SQL 失败: {}", e);
         result.duration = start.elapsed().as_secs_f64();
+        logging::error(format!(
+            "db::execute_on_database 失败 database={} duration={:.6} error={}",
+            db_name, result.duration, result.error
+        ));
+        return result;
+    }
+
+    if let Some(reason) = rollback_reason() {
+        let _ = conn.query_drop("ROLLBACK");
+        result.error = reason;
+        result.duration = start.elapsed().as_secs_f64();
+        logging::debug(format!(
+            "db::execute_on_database 回滚 database={} duration={:.6} reason={}",
+            db_name, result.duration, result.error
+        ));
         return result;
     }
 
@@ -221,11 +294,19 @@ pub fn execute_on_database(pool: &Pool, db_name: &str, sql: &str) -> ExecResult 
         let _ = conn.query_drop("ROLLBACK");
         result.error = format!("提交事务失败: {}", e);
         result.duration = start.elapsed().as_secs_f64();
+        logging::error(format!(
+            "db::execute_on_database 失败 database={} duration={:.6} error={}",
+            db_name, result.duration, result.error
+        ));
         return result;
     }
 
     result.success = true;
     result.duration = start.elapsed().as_secs_f64();
+    logging::debug(format!(
+        "db::execute_on_database 完成 database={} duration={:.6}",
+        db_name, result.duration
+    ));
     result
 }
 
@@ -394,7 +475,11 @@ mod tests {
         assert!(json.contains("\"success\":true"));
         assert!(json.contains("\"database\":\"mydb\""));
         assert!(json.contains("\"duration\":0.42"));
-        assert!(!json.contains("\"error\""), "empty error should be absent: {}", json);
+        assert!(
+            !json.contains("\"error\""),
+            "empty error should be absent: {}",
+            json
+        );
     }
 
     #[test]
@@ -580,7 +665,10 @@ mod tests {
         // Invalid SQL should produce an error result
         let result = execute_on_database(&pool, test_db, "SYNTAX ERROR NOT VALID SQL");
         assert!(!result.success, "invalid SQL should fail");
-        assert!(!result.error.is_empty(), "error message should be populated");
+        assert!(
+            !result.error.is_empty(),
+            "error message should be populated"
+        );
         assert_eq!(result.database, *test_db);
         assert!(result.duration >= 0.0);
         eprintln!(
@@ -601,8 +689,7 @@ mod tests {
             }
         };
 
-        let result =
-            execute_on_database(&pool, "nonexistent_db_xyz_12345", "SELECT 1");
+        let result = execute_on_database(&pool, "nonexistent_db_xyz_12345", "SELECT 1");
         assert!(!result.success);
         assert!(!result.error.is_empty());
         assert_eq!(result.database, "nonexistent_db_xyz_12345");

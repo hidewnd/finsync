@@ -1,8 +1,20 @@
 use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tauri::{command, AppHandle, Emitter};
 
 use crate::config::{self, ConnectionConfig};
 use crate::db::{self, ExecResult};
+use crate::logging;
+
+const CONTROL_CONTINUE: u8 = 0;
+const CONTROL_STOP: u8 = 1;
+const CONTROL_SKIP: u8 = 2;
+const STOP_ROLLBACK_MESSAGE: &str = "已终止执行，已回滚当前数据库";
+const SKIP_ROLLBACK_MESSAGE: &str = "已跳过执行，已回滚当前数据库";
+
+static EXECUTION_CONTROL: AtomicU8 = AtomicU8::new(CONTROL_CONTINUE);
 
 // ── list_connections ──────────────────────────────────────────────
 //
@@ -12,7 +24,48 @@ use crate::db::{self, ExecResult};
 #[command]
 pub fn list_connections() -> Result<Vec<ConnectionConfig>, String> {
     let path = config::find_config_path();
-    config::parse_config(&path)
+    logging::debug(format!("list_connections 开始 config_path={}", path));
+    match config::parse_config(&path) {
+        Ok(configs) => {
+            logging::debug(format!("list_connections 完成 count={}", configs.len()));
+            Ok(configs)
+        }
+        Err(err) => {
+            logging::error(format!("list_connections 失败 error={}", err));
+            Err(err)
+        }
+    }
+}
+
+fn config_dir_from_path(config_path: &str) -> Result<PathBuf, String> {
+    Path::new(config_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("无法解析配置文件所在目录: {}", config_path))
+}
+
+#[command]
+pub fn open_config_dir() -> Result<(), String> {
+    let config_path = config::find_config_path();
+    let config_dir = config_dir_from_path(&config_path)?;
+
+    logging::debug(format!(
+        "open_config_dir 开始 config_path={} dir={}",
+        config_path,
+        config_dir.display()
+    ));
+
+    Command::new("explorer.exe")
+        .arg(&config_dir)
+        .spawn()
+        .map_err(|err| {
+            let message = format!("打开配置目录失败: {}", err);
+            logging::error(format!("open_config_dir 失败 error={}", message));
+            message
+        })?;
+
+    logging::debug(format!("open_config_dir 完成 dir={}", config_dir.display()));
+    Ok(())
 }
 
 // ── match_databases ───────────────────────────────────────────────
@@ -28,15 +81,40 @@ pub fn match_databases(
     suffix: String,
 ) -> Result<Vec<String>, String> {
     let path = config::find_config_path();
+    logging::debug(format!(
+        "match_databases 开始 config_path={} connection={} prefix={} suffix={}",
+        path, connection_name, prefix, suffix
+    ));
     let configs = config::parse_config(&path)?;
 
     let cfg = configs
         .iter()
         .find(|c| c.name == connection_name)
-        .ok_or_else(|| format!("找不到连接 '{}'", connection_name))?;
+        .ok_or_else(|| {
+            let err = format!("找不到连接 '{}'", connection_name);
+            logging::error(format!("match_databases 失败 error={}", err));
+            err
+        })?;
 
+    logging::debug(format!(
+        "match_databases 连接 {}",
+        logging::format_connection_for_log(cfg)
+    ));
     let pool = db::connect(cfg)?;
-    db::list_databases(&pool, &prefix, &suffix)
+    match db::list_databases(&pool, &prefix, &suffix) {
+        Ok(databases) => {
+            logging::debug(format!(
+                "match_databases 完成 count={} databases={:?}",
+                databases.len(),
+                databases
+            ));
+            Ok(databases)
+        }
+        Err(err) => {
+            logging::error(format!("match_databases 失败 error={}", err));
+            Err(err)
+        }
+    }
 }
 
 // ── execute_sql event payloads ────────────────────────────────────
@@ -44,9 +122,50 @@ pub fn match_databases(
 /// Emitted once per database after SQL execution completes.
 /// Payload for the `exec-result` Tauri event.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+#[serde(rename_all = "snake_case")]
+enum ExecStatus {
+    Success,
+    Failure,
+    Skipped,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionControl {
+    Continue,
+    Stop,
+    Skip,
+}
+
+impl ExecutionControl {
+    fn from_atomic(value: u8) -> Self {
+        match value {
+            CONTROL_STOP => Self::Stop,
+            CONTROL_SKIP => Self::Skip,
+            _ => Self::Continue,
+        }
+    }
+}
+
+fn status_from_result(result: &ExecResult) -> ExecStatus {
+    if result.success {
+        ExecStatus::Success
+    } else if result.error == SKIP_ROLLBACK_MESSAGE || result.error == "已跳过执行" {
+        ExecStatus::Skipped
+    } else if result.error == STOP_ROLLBACK_MESSAGE {
+        ExecStatus::Stopped
+    } else {
+        ExecStatus::Failure
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ExecResultPayload {
     /// Human-readable progress indicator, e.g. "3/10".
     progress: String,
+    /// Machine-readable status for UI counts and user-requested control flow.
+    status: ExecStatus,
     /// The execution result for a single database.
     result: ExecResult,
 }
@@ -57,6 +176,8 @@ struct ExecCompleteSummary {
     total: usize,
     success_count: usize,
     fail_count: usize,
+    skipped_count: usize,
+    stopped: bool,
 }
 
 /// Emitted once after all databases have been processed.
@@ -84,26 +205,105 @@ fn run_execution(
     databases: &[String],
     sql: &str,
     mut execute: impl FnMut(&str, &str) -> ExecResult,
+    mut control: impl FnMut(&str) -> ExecutionControl,
     mut on_result: impl FnMut(ExecResultPayload),
     on_complete: impl FnOnce(ExecCompletePayload),
 ) {
     let total = databases.len();
     let mut success_count = 0usize;
     let mut fail_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut stopped = false;
+    logging::debug(format!(
+        "run_execution 开始 total={} databases={:?} sql={}",
+        total, databases, sql
+    ));
 
     for (i, db_name) in databases.iter().enumerate() {
+        match control(db_name) {
+            ExecutionControl::Continue => {}
+            ExecutionControl::Skip => {
+                skipped_count += 1;
+                logging::debug(format!(
+                    "run_execution 跳过数据库 progress={}/{} database={}",
+                    i + 1,
+                    total,
+                    db_name
+                ));
+                on_result(ExecResultPayload {
+                    progress: format!("{}/{}", i + 1, total),
+                    status: ExecStatus::Skipped,
+                    result: ExecResult {
+                        database: db_name.to_string(),
+                        success: false,
+                        error: "已跳过执行".into(),
+                        duration: 0.0,
+                    },
+                });
+                continue;
+            }
+            ExecutionControl::Stop => {
+                stopped = true;
+                logging::debug(format!(
+                    "run_execution 终止执行 before_database={} progress={}/{}",
+                    db_name,
+                    i + 1,
+                    total
+                ));
+                break;
+            }
+        }
+
+        logging::debug(format!(
+            "run_execution 执行数据库 progress={}/{} database={} sql={}",
+            i + 1,
+            total,
+            db_name,
+            sql
+        ));
         let result = execute(db_name, sql);
 
-        if result.success {
-            success_count += 1;
-        } else {
-            fail_count += 1;
-        }
+        let status = status_from_result(&result);
+        match status {
+            ExecStatus::Success => {
+                success_count += 1;
+                logging::debug(format!(
+                    "run_execution 数据库完成 database={} success=true duration={:.6}",
+                    result.database, result.duration
+                ));
+            }
+            ExecStatus::Skipped => {
+                skipped_count += 1;
+                logging::debug(format!(
+                    "run_execution 数据库跳过 database={} duration={:.6}",
+                    result.database, result.duration
+                ));
+            }
+            ExecStatus::Stopped => {
+                stopped = true;
+                logging::debug(format!(
+                    "run_execution 数据库终止 database={} duration={:.6}",
+                    result.database, result.duration
+                ));
+            }
+            ExecStatus::Failure => {
+                fail_count += 1;
+                logging::error(format!(
+                    "run_execution 数据库失败 database={} duration={:.6} error={}",
+                    result.database, result.duration, result.error
+                ));
+            }
+        };
 
         on_result(ExecResultPayload {
             progress: format!("{}/{}", i + 1, total),
+            status,
             result,
         });
+
+        if stopped {
+            break;
+        }
     }
 
     on_complete(ExecCompletePayload {
@@ -111,8 +311,40 @@ fn run_execution(
             total,
             success_count,
             fail_count,
+            skipped_count,
+            stopped,
         },
     });
+    logging::debug(format!(
+        "run_execution 完成 total={} success_count={} fail_count={} skipped_count={} stopped={}",
+        total, success_count, fail_count, skipped_count, stopped
+    ));
+}
+
+fn take_execution_control() -> ExecutionControl {
+    ExecutionControl::from_atomic(EXECUTION_CONTROL.swap(CONTROL_CONTINUE, Ordering::SeqCst))
+}
+
+fn take_rollback_reason() -> Option<String> {
+    match take_execution_control() {
+        ExecutionControl::Continue => None,
+        ExecutionControl::Stop => Some(STOP_ROLLBACK_MESSAGE.into()),
+        ExecutionControl::Skip => Some(SKIP_ROLLBACK_MESSAGE.into()),
+    }
+}
+
+#[command]
+pub fn stop_execution() -> Result<(), String> {
+    EXECUTION_CONTROL.store(CONTROL_STOP, Ordering::SeqCst);
+    logging::debug("stop_execution 已请求终止执行".to_string());
+    Ok(())
+}
+
+#[command]
+pub fn skip_execution() -> Result<(), String> {
+    EXECUTION_CONTROL.store(CONTROL_SKIP, Ordering::SeqCst);
+    logging::debug("skip_execution 已请求跳过当前数据库".to_string());
+    Ok(())
 }
 
 #[command]
@@ -123,21 +355,41 @@ pub fn execute_sql(
     sql: String,
 ) -> Result<(), String> {
     let path = config::find_config_path();
+    logging::debug(format!(
+        "execute_sql 开始 config_path={} connection={} database_count={} databases={:?} sql={}",
+        path,
+        connection_name,
+        databases.len(),
+        databases,
+        sql
+    ));
     let configs = config::parse_config(&path)?;
 
     let cfg = configs
         .iter()
         .find(|c| c.name == connection_name)
-        .ok_or_else(|| format!("找不到连接 '{}'", connection_name))?
+        .ok_or_else(|| {
+            let err = format!("找不到连接 '{}'", connection_name);
+            logging::error(format!("execute_sql 失败 error={}", err));
+            err
+        })?
         .clone();
 
+    logging::debug(format!(
+        "execute_sql 连接 {}",
+        logging::format_connection_for_log(&cfg)
+    ));
     let pool = db::connect(&cfg)?;
+    EXECUTION_CONTROL.store(CONTROL_CONTINUE, Ordering::SeqCst);
 
     std::thread::spawn(move || {
         run_execution(
             &databases,
             &sql,
-            |db_name, s| db::execute_on_database(&pool, db_name, s),
+            |db_name, s| {
+                db::execute_on_database_with_control(&pool, db_name, s, take_rollback_reason)
+            },
+            |_db_name| take_execution_control(),
             |payload| {
                 let _ = app_handle.emit("exec-result", payload);
             },
@@ -155,6 +407,7 @@ pub fn execute_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
@@ -188,10 +441,7 @@ mod tests {
         let mut f = fs::File::create(&path).expect("create cwd config.ini");
         f.write_all(content.as_bytes())
             .expect("write cwd config.ini");
-        CwdConfigGuard {
-            _lock: lock,
-            path,
-        }
+        CwdConfigGuard { _lock: lock, path }
     }
 
     // ── list_connections ──────────────────────────────────────
@@ -245,6 +495,14 @@ password=root
         assert!(configs.is_empty());
     }
 
+    #[test]
+    fn config_dir_from_path_returns_parent_directory() {
+        let dir = config_dir_from_path(r"E:\Projects\finsync\config.ini")
+            .expect("config.ini path should have parent directory");
+
+        assert_eq!(dir, PathBuf::from(r"E:\Projects\finsync"));
+    }
+
     // ── match_databases ───────────────────────────────────────
 
     #[test]
@@ -277,6 +535,7 @@ password=root
     fn execute_sql_payload_structs_serialize() {
         let erp = ExecResultPayload {
             progress: "3/10".into(),
+            status: ExecStatus::Success,
             result: ExecResult {
                 database: "test_db".into(),
                 success: true,
@@ -290,13 +549,19 @@ password=root
         assert!(json.contains("\"success\":true"));
         assert!(json.contains("\"duration\":0.42"));
         // error should be absent when empty
-        assert!(!json.contains("\"error\""), "empty error should be absent: {}", json);
+        assert!(
+            !json.contains("\"error\""),
+            "empty error should be absent: {}",
+            json
+        );
 
         let ecp = ExecCompletePayload {
             summary: ExecCompleteSummary {
                 total: 10,
                 success_count: 8,
                 fail_count: 2,
+                skipped_count: 0,
+                stopped: false,
             },
         };
         let json = serde_json::to_string(&ecp).expect("serialize");
@@ -309,6 +574,7 @@ password=root
     fn execute_sql_error_payload_serializes_error_field() {
         let erp = ExecResultPayload {
             progress: "1/5".into(),
+            status: ExecStatus::Failure,
             result: ExecResult {
                 database: "fail_db".into(),
                 success: false,
@@ -325,6 +591,7 @@ password=root
     fn execute_sql_payload_progress_format() {
         let erp = ExecResultPayload {
             progress: "7/10".into(),
+            status: ExecStatus::Success,
             result: ExecResult {
                 database: "db7".into(),
                 success: true,
@@ -343,6 +610,8 @@ password=root
                 total: 5,
                 success_count: 3,
                 fail_count: 2,
+                skipped_count: 0,
+                stopped: false,
             },
         };
         let json = serde_json::to_string(&ecp).expect("serialize");
@@ -383,6 +652,7 @@ password=root
             &dbs,
             "SELECT 1",
             |db, sql| mock_exec_success(db, sql),
+            |_| ExecutionControl::Continue,
             |payload| results.push(payload),
             |_payload| {},
         );
@@ -411,6 +681,7 @@ password=root
                     mock_exec_failure(db, sql)
                 }
             },
+            |_| ExecutionControl::Continue,
             |payload| {
                 if payload.result.success {
                     success_count += 1;
@@ -434,6 +705,7 @@ password=root
             &dbs,
             "SELECT 1",
             |db, sql| mock_exec_success(db, sql),
+            |_| ExecutionControl::Continue,
             |payload| progressions.push(payload.progress),
             |_payload| {},
         );
@@ -452,6 +724,7 @@ password=root
             &dbs,
             "SELECT 1",
             |_, _| unreachable!(),
+            |_| ExecutionControl::Continue,
             |_| on_result_called = true,
             |payload| {
                 on_complete_called = true;
@@ -459,7 +732,10 @@ password=root
             },
         );
 
-        assert!(!on_result_called, "on_result should never be called for empty input");
+        assert!(
+            !on_result_called,
+            "on_result should never be called for empty input"
+        );
         assert!(on_complete_called, "on_complete must still be called");
         assert_eq!(summary_total, 0);
     }
@@ -473,6 +749,7 @@ password=root
             &dbs,
             "SELECT 1",
             |db, sql| mock_exec_success(db, sql),
+            |_| ExecutionControl::Continue,
             |_payload| {},
             |_payload| complete_count += 1,
         );
@@ -497,6 +774,7 @@ password=root
                     mock_exec_failure(db, sql)
                 }
             },
+            |_| ExecutionControl::Continue,
             |_payload| {},
             |payload| final_summary = Some(payload.summary),
         );
@@ -521,6 +799,7 @@ password=root
                 error: String::new(),
                 duration: 0.0,
             },
+            |_| ExecutionControl::Continue,
             |payload| result = payload.result.database,
             |_| {},
         );
@@ -542,6 +821,7 @@ password=root
                 error: "syntax error at line 1".into(),
                 duration: 0.3,
             },
+            |_| ExecutionControl::Continue,
             |payload| captured_error = payload.result.error,
             |_| {},
         );
@@ -560,6 +840,7 @@ password=root
             &dbs,
             "SELECT 1",
             |db, sql| mock_exec_success(db, sql),
+            |_| ExecutionControl::Continue,
             |payload| result_payloads.push(payload),
             |payload| complete_payload = Some(payload),
         );
@@ -570,6 +851,165 @@ password=root
         assert_eq!(comp.summary.total, 1);
         assert_eq!(comp.summary.success_count, 1);
         assert_eq!(comp.summary.fail_count, 0);
+    }
+
+    #[test]
+    fn run_execution_skips_current_database_and_continues() {
+        let dbs: Vec<String> = vec!["db1".into(), "db2".into(), "db3".into()];
+        let mut executed: Vec<String> = Vec::new();
+        let mut result_payloads: Vec<ExecResultPayload> = Vec::new();
+        let mut complete_payload: Option<ExecCompletePayload> = None;
+        let control_checks = Cell::new(0usize);
+
+        run_execution(
+            &dbs,
+            "SELECT 1",
+            |db, _sql| {
+                executed.push(db.to_string());
+                ExecResult {
+                    database: db.to_string(),
+                    success: true,
+                    error: String::new(),
+                    duration: 0.0,
+                }
+            },
+            |_db| {
+                let check = control_checks.get();
+                control_checks.set(check + 1);
+                if check == 0 {
+                    ExecutionControl::Skip
+                } else {
+                    ExecutionControl::Continue
+                }
+            },
+            |payload| result_payloads.push(payload),
+            |payload| complete_payload = Some(payload),
+        );
+
+        assert_eq!(executed, vec!["db2", "db3"]);
+        assert_eq!(result_payloads.len(), 3);
+        assert_eq!(result_payloads[0].result.database, "db1");
+        assert_eq!(result_payloads[0].status, ExecStatus::Skipped);
+        assert_eq!(result_payloads[1].status, ExecStatus::Success);
+
+        let comp = complete_payload.expect("complete should fire");
+        assert_eq!(comp.summary.total, 3);
+        assert_eq!(comp.summary.success_count, 2);
+        assert_eq!(comp.summary.fail_count, 0);
+        assert_eq!(comp.summary.skipped_count, 1);
+        assert!(!comp.summary.stopped);
+    }
+
+    #[test]
+    fn run_execution_stops_before_next_database() {
+        let dbs: Vec<String> = vec!["db1".into(), "db2".into(), "db3".into()];
+        let mut executed: Vec<String> = Vec::new();
+        let mut result_payloads: Vec<ExecResultPayload> = Vec::new();
+        let mut complete_payload: Option<ExecCompletePayload> = None;
+        let control_checks = Cell::new(0usize);
+
+        run_execution(
+            &dbs,
+            "SELECT 1",
+            |db, _sql| {
+                executed.push(db.to_string());
+                ExecResult {
+                    database: db.to_string(),
+                    success: true,
+                    error: String::new(),
+                    duration: 0.0,
+                }
+            },
+            |_db| {
+                let check = control_checks.get();
+                control_checks.set(check + 1);
+                if check == 1 {
+                    ExecutionControl::Stop
+                } else {
+                    ExecutionControl::Continue
+                }
+            },
+            |payload| result_payloads.push(payload),
+            |payload| complete_payload = Some(payload),
+        );
+
+        assert_eq!(executed, vec!["db1"]);
+        assert_eq!(result_payloads.len(), 1);
+        assert_eq!(result_payloads[0].status, ExecStatus::Success);
+
+        let comp = complete_payload.expect("complete should fire");
+        assert_eq!(comp.summary.total, 3);
+        assert_eq!(comp.summary.success_count, 1);
+        assert_eq!(comp.summary.fail_count, 0);
+        assert_eq!(comp.summary.skipped_count, 0);
+        assert!(comp.summary.stopped);
+    }
+
+    #[test]
+    fn run_execution_counts_rollback_skip_without_failure() {
+        let dbs: Vec<String> = vec!["db1".into(), "db2".into()];
+        let mut result_payloads: Vec<ExecResultPayload> = Vec::new();
+        let mut complete_payload: Option<ExecCompletePayload> = None;
+
+        run_execution(
+            &dbs,
+            "UPDATE t SET v = 1",
+            |db, _sql| ExecResult {
+                database: db.to_string(),
+                success: false,
+                error: SKIP_ROLLBACK_MESSAGE.into(),
+                duration: 0.0,
+            },
+            |_| ExecutionControl::Continue,
+            |payload| result_payloads.push(payload),
+            |payload| complete_payload = Some(payload),
+        );
+
+        assert_eq!(result_payloads.len(), 2);
+        assert!(result_payloads
+            .iter()
+            .all(|payload| payload.status == ExecStatus::Skipped));
+
+        let comp = complete_payload.expect("complete should fire");
+        assert_eq!(comp.summary.success_count, 0);
+        assert_eq!(comp.summary.fail_count, 0);
+        assert_eq!(comp.summary.skipped_count, 2);
+        assert!(!comp.summary.stopped);
+    }
+
+    #[test]
+    fn run_execution_stops_after_rollback_stop_result() {
+        let dbs: Vec<String> = vec!["db1".into(), "db2".into()];
+        let mut executed: Vec<String> = Vec::new();
+        let mut result_payloads: Vec<ExecResultPayload> = Vec::new();
+        let mut complete_payload: Option<ExecCompletePayload> = None;
+
+        run_execution(
+            &dbs,
+            "UPDATE t SET v = 1",
+            |db, _sql| {
+                executed.push(db.to_string());
+                ExecResult {
+                    database: db.to_string(),
+                    success: false,
+                    error: STOP_ROLLBACK_MESSAGE.into(),
+                    duration: 0.0,
+                }
+            },
+            |_| ExecutionControl::Continue,
+            |payload| result_payloads.push(payload),
+            |payload| complete_payload = Some(payload),
+        );
+
+        assert_eq!(executed, vec!["db1"]);
+        assert_eq!(result_payloads.len(), 1);
+        assert_eq!(result_payloads[0].status, ExecStatus::Stopped);
+
+        let comp = complete_payload.expect("complete should fire");
+        assert_eq!(comp.summary.success_count, 0);
+        assert_eq!(comp.summary.fail_count, 0);
+        assert_eq!(comp.summary.skipped_count, 0);
+        assert!(comp.summary.stopped);
     }
 
     // ── execute_sql command (direct invocation) ───────────────
@@ -666,6 +1106,7 @@ password=root
                 &dbs,
                 "SELECT 1",
                 |db, _| mock_exec_success(db, ""),
+                |_| ExecutionControl::Continue,
                 move |payload| {
                     let _ = tx_result.send(payload);
                 },

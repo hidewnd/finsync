@@ -12,7 +12,8 @@ fn c1_verify_traditional_format() {
     let mut f = fs::File::create(&path).expect("create temp");
     f.write_all(content.as_bytes()).expect("write temp");
 
-    let configs = app_lib::config::parse_config(&path.to_string_lossy()).expect("parse should succeed");
+    let configs =
+        app_lib::config::parse_config(&path.to_string_lossy()).expect("parse should succeed");
     let _ = fs::remove_file(&path);
 
     assert_eq!(configs.len(), 1);
@@ -32,7 +33,8 @@ fn c1_verify_traditional_with_spaces() {
     let mut f = fs::File::create(&path).expect("create temp");
     f.write_all(content.as_bytes()).expect("write temp");
 
-    let configs = app_lib::config::parse_config(&path.to_string_lossy()).expect("parse should succeed");
+    let configs =
+        app_lib::config::parse_config(&path.to_string_lossy()).expect("parse should succeed");
     let _ = fs::remove_file(&path);
 
     assert_eq!(configs[0].host, "10.0.0.1");
@@ -60,7 +62,8 @@ fn c2_verify_jdbc_url_with_port() {
 #[test]
 fn c2_verify_jdbc_url_default_port() {
     // No explicit port → should default to 3306
-    let content = "[jdbc2]\nurl=jdbc:mysql://db.example.com/somedb?charset=utf8\nuser=u\npassword=p\n";
+    let content =
+        "[jdbc2]\nurl=jdbc:mysql://db.example.com/somedb?charset=utf8\nuser=u\npassword=p\n";
     let path = std::env::temp_dir().join("eval_c2b.ini");
     let mut f = fs::File::create(&path).expect("create temp");
     f.write_all(content.as_bytes()).expect("write temp");
@@ -109,7 +112,11 @@ fn c3_verify_url_precedence_url_after_host() {
 fn c4_verify_find_config_path_format() {
     let path = app_lib::config::find_config_path();
     eprintln!("c4: find_config_path returned: {}", path);
-    assert!(path.ends_with("config.ini"), "Path should end with config.ini, got: {}", path);
+    assert!(
+        path.ends_with("config.ini"),
+        "Path should end with config.ini, got: {}",
+        path
+    );
     eprintln!("c4 PASS: Path ends with config.ini");
 }
 
@@ -130,7 +137,8 @@ fn c5_verify_comments_semicolon() {
 
 #[test]
 fn c5_verify_comments_hash() {
-    let content = "# top comment\n[section]\n# mid comment\nhost=5.6.7.8\nport=3307\nuser=u\npassword=p\n";
+    let content =
+        "# top comment\n[section]\n# mid comment\nhost=5.6.7.8\nport=3307\nuser=u\npassword=p\n";
     let path = std::env::temp_dir().join("eval_c5b.ini");
     let mut f = fs::File::create(&path).expect("create temp");
     f.write_all(content.as_bytes()).expect("write temp");

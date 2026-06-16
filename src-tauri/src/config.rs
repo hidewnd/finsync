@@ -3,6 +3,12 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+/// Top-level application settings from config.ini.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppConfig {
+    pub log_path: Option<PathBuf>,
+}
+
 /// Represents a single MySQL connection configuration.
 /// Mirrors the Go `ConnectionConfig` struct from config.go.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -45,10 +51,40 @@ pub fn find_config_path() -> String {
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    exe_dir
-        .join("config.ini")
-        .to_string_lossy()
-        .to_string()
+    exe_dir.join("config.ini").to_string_lossy().to_string()
+}
+
+/// Parses top-level application settings before the first connection section.
+pub fn parse_app_config(path: &str) -> Result<AppConfig, String> {
+    let file = fs::File::open(path).map_err(|e| format!("无法打开配置文件: {}", e))?;
+    let reader = BufReader::new(file);
+    let mut app_config = AppConfig { log_path: None };
+
+    for line_result in reader.lines() {
+        let line = line_result.map_err(|e| format!("读取配置文件失败: {}", e))?;
+        let line = line.trim().to_string();
+
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            break;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        if key.trim().eq_ignore_ascii_case("log_path") {
+            let value = value.trim();
+            if !value.is_empty() {
+                app_config.log_path = Some(PathBuf::from(value));
+            }
+        }
+    }
+
+    Ok(app_config)
 }
 
 /// Parses an INI-style config file and returns connection configurations.
@@ -402,7 +438,11 @@ password=p
     fn test_find_config_path_returns_something() {
         // Basic sanity: find_config_path should return a path ending in config.ini
         let path = find_config_path();
-        assert!(path.ends_with("config.ini"), "Expected path ending with config.ini, got: {}", path);
+        assert!(
+            path.ends_with("config.ini"),
+            "Expected path ending with config.ini, got: {}",
+            path
+        );
     }
 
     // ── c5: Comments and blank lines ignored ──
@@ -542,11 +582,57 @@ user=admin
     }
 
     #[test]
+    fn test_parse_app_config_reads_top_level_log_path() {
+        let content = r#"; app settings
+log_path=logs/debug
+
+[valid-section]
+host=10.0.0.1
+user=admin
+"#;
+        let guard = write_temp_config(content);
+        let app_config = parse_app_config(&guard.0.to_string_lossy()).expect("parse app config");
+
+        assert_eq!(app_config.log_path, Some(PathBuf::from("logs/debug")));
+    }
+
+    #[test]
+    fn test_parse_app_config_ignores_section_log_path() {
+        let content = r#"[valid-section]
+log_path=should-not-be-app-setting
+host=10.0.0.1
+"#;
+        let guard = write_temp_config(content);
+        let app_config = parse_app_config(&guard.0.to_string_lossy()).expect("parse app config");
+
+        assert_eq!(app_config.log_path, None);
+    }
+
+    #[test]
+    fn test_parse_config_ignores_top_level_log_path() {
+        let content = r#"log_path=logs
+
+[valid-section]
+host=10.0.0.1
+user=admin
+"#;
+        let guard = write_temp_config(content);
+        let configs = parse_config(&guard.0.to_string_lossy()).expect("parse config");
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "valid-section");
+        assert_eq!(configs[0].host, "10.0.0.1");
+    }
+
+    #[test]
     fn test_real_config_file() {
         // Parse the actual config.ini from the Go project
         let config_path = Path::new("../../finsync/config.ini");
         if !config_path.exists() {
-            eprintln!("Skipping test: real config.ini not found at {:?}", config_path);
+            eprintln!(
+                "Skipping test: real config.ini not found at {:?}",
+                config_path
+            );
             return;
         }
 
@@ -597,7 +683,11 @@ PASSWORD=Secret
         let result = parse_config("/nonexistent/path/config.ini");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("无法打开配置文件"), "Expected '无法打开配置文件' in error, got: {}", err);
+        assert!(
+            err.contains("无法打开配置文件"),
+            "Expected '无法打开配置文件' in error, got: {}",
+            err
+        );
     }
 
     #[test]

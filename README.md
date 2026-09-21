@@ -1,119 +1,119 @@
-# MySQL 批量运维工具
+# MySQL Batch Administration Tool
 
-基于 **Tauri + Rust** 构建的轻量级 MySQL 数据库批量运维桌面应用。单 exe 运行，零环境依赖。
+**English** | [简体中文](README.zh-CN.md)
 
-## ✨ 功能
+A lightweight desktop application for batch MySQL database administration, built with **Tauri + Rust**. Runs as a single executable with no additional environment setup.
 
-| 功能 | 说明 |
-|------|------|
-| 🔗 多连接管理 | 通过 `config.ini` 配置多个 MySQL 实例，界面下拉切换 |
-| 🔍 模糊匹配 | 前缀 + 后缀 AND 逻辑匹配目标数据库 |
-| ✅ 批量勾选 | 匹配结果带勾选框，默认全选，支持全选/取消 |
-| 📝 SQL 编辑器 | 多行输入，Ctrl+Enter 快捷执行 |
-| 🔒 事务包裹 | 逐库 `START TRANSACTION → EXEC → COMMIT/ROLLBACK`，单库失败不影响其他库 |
-| 📋 实时日志 | 成功绿 / 失败红，含时间戳和耗时 |
-| 🌐 JDBC URL | 支持 `jdbc:mysql://host:port/?params` 和传统 host/port 两种配置格式 |
-| 🎨 深色主题 | 原生桌面窗口，无浏览器边框 |
+## ✨ Features
 
+| Feature | Description |
+|---------|-------------|
+| 🔗 Multiple connections | Configure multiple MySQL instances in `config.ini` and switch between them using the dropdown |
+| 🔍 Pattern matching | Match target databases by combining prefix and suffix filters with AND logic |
+| ✅ Batch selection | Matching databases are selected by default, with select-all and deselect-all controls |
+| 📝 SQL editor | Multiline input with the Ctrl+Enter shortcut to execute SQL |
+| 🔒 Transactions | Run `START TRANSACTION → EXEC → COMMIT/ROLLBACK` per database; a failure in one database does not affect the others |
+| 📋 Live logs | Green for success and red for failure, with timestamps and elapsed time |
+| 🌐 JDBC URLs | Support both `jdbc:mysql://host:port/?params` and traditional host/port configuration |
+| 🎨 Dark theme | Native desktop window without browser chrome |
 
+![Application screenshot](https://lyne-bucket.oss-cn-shanghai.aliyuncs.com/notes/202604291441562.png)
 
-![image-20260429144103490](https://lyne-bucket.oss-cn-shanghai.aliyuncs.com/notes/202604291441562.png)
+## 📦 Installation
 
-## 📦 安装
+### Option 1: Installer (recommended)
 
-### 方式一：安装包（推荐）
+Download the `MySQL 批量运维工具_*.exe` installer and double-click it to install.
 
-下载 `MySQL 批量运维工具_*.exe` 安装包，双击安装即可。
+### Option 2: Portable executable
 
-### 方式二：免安装
+Download `finsync.exe`, place it in the same directory as `config.ini`, and double-click it to run.
 
-下载 `finsync.exe`，连同 `config.ini` 放到同一目录，双击运行。
+> Requires Windows 10 or later (with the WebView2 runtime included).
 
-> 需要 Windows 10+ 系统（WebView2 运行时内置）。
+## 🔧 Configuration
 
-## 🔧 配置
-
-在 exe 同目录创建 `config.ini`：
+Create `config.ini` in the same directory as the executable:
 
 ```ini
-; 格式1 — 传统字段
-[本地开发]
+; Format 1 — Traditional fields
+[Local Development]
 host=127.0.0.1
 port=3306
 user=root
 password=root
 
-; 格式2 — JDBC URL（url 优先于 host/port）
-[阿里云RDS]
+; Format 2 — JDBC URL (url takes precedence over host/port)
+[Alibaba Cloud RDS]
 url=jdbc:mysql://rm-bp1xxxxx.mysql.rds.aliyuncs.com:3306/?characterEncoding=utf8&useSSL=false
 user=admin
 password=your_password
 
-; 多种格式可以混合使用
-[测试环境]
+; Both formats can be used in the same file
+[Test Environment]
 host=192.168.1.100
 port=3306
 user=test_user
 password=test_pass
 ```
 
-> 添加新连接后点击界面「🔄 刷新配置」即可加载，无需重启。
+> After adding a connection, click “🔄 刷新配置” (Refresh Configuration) in the app to load it without restarting.
 
-## 🚀 开发
+## 🚀 Development
 
-### 环境要求
+### Prerequisites
 
 - [Rust](https://www.rust-lang.org/) 1.70+
 - [Node.js](https://nodejs.org/) 18+
-- Windows 10+ 系统
+- Windows 10 or later
 
-### 快速开始
+### Quick start
 
 ```bash
-# 克隆项目
+# Clone the repository
 git clone https://github.com/your-username/finsync.git
 cd finsync
 
-# 安装前端依赖
+# Install frontend dependencies
 npm install
 
-# 构建前端
+# Build the frontend
 npm run build
 
-# 开发模式（热重载）
+# Start development mode with hot reload
 cargo tauri dev
 
-# 生产构建
+# Build for production
 cargo tauri build -b nsis
 ```
 
-### 项目结构
+### Project structure
 
-```
+```text
 finsync/
-├── src-tauri/           # Rust 后端
+├── src-tauri/           # Rust backend
 │   └── src/
-│       ├── main.rs      # 入口（windows_subsystem 隐藏终端）
-│       ├── lib.rs        # Tauri Builder + 命令注册
-│       ├── config.rs     # INI + JDBC URL 双格式解析
-│       ├── db.rs         # MySQL 连接 + 事务执行 + 字符集设置
-│       └── commands.rs   # Tauri IPC 命令 + 实时事件流
-├── index.html           # 深色主题 UI
-├── app.js               # 前端逻辑（Tauri invoke + events）
-├── style.css            # 样式
-└── config.ini            # 示例配置
+│       ├── main.rs      # Entry point (windows_subsystem hides the console)
+│       ├── lib.rs       # Tauri Builder and command registration
+│       ├── config.rs    # INI and JDBC URL parsing
+│       ├── db.rs        # MySQL connections, transactions, and character set settings
+│       └── commands.rs  # Tauri IPC commands and live event streams
+├── index.html          # Dark-themed UI
+├── app.js              # Frontend logic (Tauri invoke and events)
+├── style.css           # Styles
+└── config.ini          # Example configuration
 ```
 
-## 🛠 技术栈
+## 🛠 Technology stack
 
-| 层 | 技术 |
-|---|---|
-| 桌面框架 | Tauri 2.x |
-| 后端 | Rust + mysql crate |
-| 前端 | Vite + Vanilla JS |
-| 打包 | NSIS |
-| 字符集 | utf8mb4（连接池 + 事务双重设置） |
+| Layer | Technology |
+|-------|------------|
+| Desktop framework | Tauri 2.x |
+| Backend | Rust + mysql crate |
+| Frontend | Vite + Vanilla JS |
+| Packaging | NSIS |
+| Character set | utf8mb4 (configured for both the connection pool and transactions) |
 
-## 📄 许可证
+## 📄 License
 
 [MIT](LICENSE)
